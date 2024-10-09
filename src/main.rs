@@ -1,8 +1,12 @@
 use {
     clap::{crate_description, crate_name, crate_version, Arg, Command},
     solana_clap_v3_utils::{
-        input_validators::{is_url_or_moniker, is_valid_signer, normalize_to_url_if_moniker},
-        keypair::DefaultSigner,
+        input_parsers::{
+            parse_url_or_moniker,
+            signer::{SignerSource, SignerSourceParserBuilder},
+        },
+        input_validators::normalize_to_url_if_moniker,
+        keypair::signer_from_path,
     },
     solana_client::{
         connection_cache::ConnectionCache,
@@ -36,17 +40,15 @@ async fn process_ping(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let from = signer.pubkey();
     let to = signer.pubkey();
-    let blockhash = rpc_client.get_latest_blockhash().await?;
     let messages = (0..num_messages)
         .map(|i| {
-            Message::new_with_blockhash(
+            Message::new(
                 &[
-                    ComputeBudgetInstruction::set_compute_unit_price(1_000_000),
+                    ComputeBudgetInstruction::set_compute_unit_price(20_000),
                     ComputeBudgetInstruction::set_compute_unit_limit(450),
                     system_instruction::transfer(&from, &to, i),
                 ],
                 Some(&signer.pubkey()),
-                &blockhash,
             )
         })
         .collect::<Vec<_>>();
@@ -124,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arg::new("keypair")
                 .long("keypair")
                 .value_name("KEYPAIR")
-                .validator(|s| is_valid_signer(s))
+                .value_parser(SignerSourceParserBuilder::default().allow_all().build())
                 .takes_value(true)
                 .global(true)
                 .help("Filepath or URL to a keypair [default: client keypair]"),
@@ -136,7 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .value_name("URL")
                 .takes_value(true)
                 .global(true)
-                .validator(|s| is_url_or_moniker(s))
+                .value_parser(parse_url_or_moniker)
                 .help("JSON RPC URL for the cluster [default: value from configuration file]"),
         )
         .subcommand(
@@ -170,28 +172,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             solana_cli_config::Config::default()
         };
 
-        let default_signer = DefaultSigner::new(
-            "keypair",
-            matches
-                .value_of("keypair")
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| cli_config.keypair_path.clone()),
-        );
+        let default_signer = if let Some((signer, _)) =
+            SignerSource::try_get_signer(matches, "keypair", &mut wallet_manager)?
+        {
+            signer
+        } else {
+            signer_from_path(
+                matches,
+                &cli_config.keypair_path,
+                "fee_payer",
+                &mut wallet_manager,
+            )?
+        };
 
         let json_rpc_url = normalize_to_url_if_moniker(
             matches
-                .value_of("json_rpc_url")
+                .get_one::<String>("json_rpc_url")
                 .unwrap_or(&cli_config.json_rpc_url),
         );
 
         let websocket_url = solana_cli_config::Config::compute_websocket_url(&json_rpc_url);
         Config {
-            default_signer: default_signer
-                .signer_from_path(matches, &mut wallet_manager)
-                .unwrap_or_else(|err| {
-                    eprintln!("error: {err}");
-                    exit(1);
-                }),
+            default_signer,
             json_rpc_url,
             websocket_url,
         }
